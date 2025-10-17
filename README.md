@@ -7,6 +7,8 @@
   Control the gas, brake, steering, and more. Read the speed, steering angle, and more.
 </p>
 
+# Dolphin
+
 <h3>
   <a href="https://docs.comma.ai">Docs</a>
   <span> · </span>
