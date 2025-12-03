@@ -1,6 +1,6 @@
 from opendbc.can import CANPacker
 from opendbc.car import structs
-from opendbc.car.vinfast.values import CarControllerParams
+from opendbc.car.vinfast.values import CarControllerParams, CANBUS
 
 # CRC-8 lookup table for VinFast checksum (from /data/card implementation)
 VINFAST_CRC8_TABLE = [
@@ -29,17 +29,29 @@ VINFAST_CRC8_TABLE = [
 ]
 
 
-def vinfast_checksum(data):
+def vinfast_checksum(data: bytes) -> int:
     """
     Calculate VinFast CRC-8 checksum.
     Checksum is calculated on bytes 1 to end (excluding first byte).
-    Initial value: 0xFF, Final XOR: 0xFF
+    Initial value: 0xFF, Final XOR: 0xFF.
     """
     crc = 0xFF
-    for byte in data[1:]:  # Skip first byte
+    for byte in data[1:]:
         crc = VINFAST_CRC8_TABLE[crc ^ byte]
-    crc ^= 0xFF  # Final XOR with 0xFF
+    crc ^= 0xFF
     return crc
+
+
+def _apply_checksum(packer: CANPacker, msg_name: str, bus: int,
+                    checksum_field: str, values: dict) -> tuple[int, bytes, int]:
+    """
+    Helper that packs a CAN message, computes VinFast checksum, updates the checksum
+    field, then returns the final CAN message tuple (address, data, bus).
+    """
+    msg = packer.make_can_msg(msg_name, bus, values)
+    checksum = vinfast_checksum(msg[1])
+    values[checksum_field] = checksum
+    return packer.make_can_msg(msg_name, bus, values)
 
 
 def create_steering_control(packer, CP, frame, apply_angle, lat_active):
@@ -48,48 +60,18 @@ def create_steering_control(packer, CP, frame, apply_angle, lat_active):
     Message ID: 0x37A (890 decimal)
     VF8 uses angle-based steering control
     """
-    # ADAS_EPS_AOLReq: Angle request in degrees
-    # Factor: 0.0238, Offset: -780, Range: -780 to 779.7 degrees
-    # Convert angle to raw value: (angle + 780) / 0.0238
-    angle_request = apply_angle if lat_active else 0.0
-    angle_request = max(-780.0, min(779.7, angle_request))  # Clamp to valid range
-    angle_raw = int(round((angle_request + 780.0) / 0.0238))
-    
-    # TOLAct: Torque Override Limit Active (0=no override, 1=override, 2=error, 3=not available)
-    # Set to 0 for angle control
-    tol_act = 0
-    
-    # AOLAct: Angle Override Limit Active (set to 1 for active angle control)
-    aol_act = 1 if lat_active else 0
-    
-    # Torque factor request: set to 0 for angle control (not used)
-    torque_factor = 0.0
-    
-    # Alive counter: 0-14 (4 bits)
     alive = frame % 15
-    
-    # Initial values (checksum will be calculated after encoding)
     values = {
         "CHKSM_ADAS_EPS_LATE_CON": 0,  # Will be calculated
         "ALV_ADAS_EPS_LATE_CON": alive,
-        "ADAS_EPS_StrWhe_TOLAct": tol_act,
-        "ADAS_EPS_StrWhe_AOLAct": aol_act,
-        "ADAS_EPS_AOLReq": angle_raw,
-        "ADAS_EPS_Torq_Fact_Req": int(torque_factor / 0.01),
+        "ADAS_EPS_StrWhe_TOLAct": 0,
+        "ADAS_EPS_StrWhe_AOLAct": 1 if lat_active else 0,
+        "ADAS_EPS_AOLReq": apply_angle if lat_active else 0.0,
+        "ADAS_EPS_Torq_Fact_Req": 1,
         "SECCAN_ADAS_EPS_LATE_CON": 0,  # TODO: Implement SECCAN if needed
     }
-    
-    # Create message first to calculate checksum
-    msg = packer.make_can_msg("ADAS_EPS_LATE_CON", 0, values)
-    
-    # Calculate checksum on bytes 1 to end
-    checksum = vinfast_checksum(msg.dat)
-    
-    # Update values with calculated checksum
-    values["CHKSM_ADAS_EPS_LATE_CON"] = checksum
-    
-    # Return message with proper checksum
-    return packer.make_can_msg("ADAS_EPS_LATE_CON", 0, values)
+
+    return _apply_checksum(packer, "ADAS_EPS_LATE_CON", CANBUS.chassis, "CHKSM_ADAS_EPS_LATE_CON", values)
 
 
 def create_acc_control(packer, CP, frame, accel, long_active, standstill):
@@ -97,37 +79,23 @@ def create_acc_control(packer, CP, frame, accel, long_active, standstill):
     Create ACC control message (ADAS_ACC_Status)
     Message ID: 0x32D (813 decimal)
     """
-    # Alive counter: 0-14 (4 bits)
     alive = frame % 15
 
     # Clip acceleration within allowed range (-6 to 6 m/s^2 based on DBC)
     accel_cmd = max(-6.0, min(6.0, accel)) if long_active else 0.0
-    decel_active = 1 if accel_cmd < 0 else 0
-
-    # ACC modes (matching standalone controller implementation)
-    acc_main_mode = 1 if long_active else 0
-    acc_mode = 4 if long_active else 2
-
-    # Convert acceleration to raw value (factor 0.005, offset -6)
-    accel_raw = int(round((accel_cmd + 6.0) / 0.005))
 
     values = {
         "CRC_ACC_STATUS": 0,  # will be calculated
         "Alive_ACC_STATUS": alive,
         "ADAS_ACC_Information": 0,
-        "ADAS_ACC_Main_Mode": acc_main_mode,
-        "ADAS_ACC_AccelDecel_Cmd": accel_raw,
+        "ADAS_ACC_Main_Mode": 1 if long_active else 0,
+        "ADAS_ACC_AccelDecel_Cmd": accel_cmd,
         "ADAS_ACC_StandstillReq": 1 if (standstill and long_active) else 0,
-        "ADAS_ACC_Mode": acc_mode,
-        "ADAS_ACC_IDB_DecCmdAct": decel_active,
+        "ADAS_ACC_Mode": 4 if long_active else 2,
+        "ADAS_ACC_IDB_DecCmdAct": 1 if accel_cmd < 0 else 0,
     }
 
-    msg = packer.make_can_msg("ADAS_ACC_Status", 0, values)
-
-    checksum = vinfast_checksum(msg.dat)
-    values["CRC_ACC_STATUS"] = checksum
-
-    return packer.make_can_msg("ADAS_ACC_Status", 0, values)
+    return _apply_checksum(packer, "ADAS_ACC_Status", CANBUS.cam, "CRC_ACC_STATUS", values)
 
 
 def create_lka_control(packer, CP, frame, lat_active):
@@ -137,13 +105,13 @@ def create_lka_control(packer, CP, frame, lat_active):
     """
     # LSS activation: 0=off, 1=standby, 2=active, 3=error
     lss_activation = 2 if lat_active else 0
-    
+
     # Haptic warning: 0=off, 1=on
     hap_warning = 0
-    
+
     # Alive counter: 0-14 (4 bits)
     alive = frame % 15
-    
+
     # Initial values (checksum will be calculated after encoding)
     values = {
         "ADAS_LKA_Checksum": 0,  # Will be calculated
@@ -152,16 +120,94 @@ def create_lka_control(packer, CP, frame, lat_active):
         "SECCAN_ADAS_LKA": 0,  # TODO: Implement SECCAN if needed
         "ADAS_HapWarning": hap_warning,
     }
-    
-    # Create message first to calculate checksum
-    msg = packer.make_can_msg("ADAS_LKA", 0, values)
-    
-    # Calculate checksum on bytes 1 to end
-    checksum = vinfast_checksum(msg.dat)
-    
-    # Update values with calculated checksum
-    values["ADAS_LKA_Checksum"] = checksum
-    
-    # Return message with proper checksum
-    return packer.make_can_msg("ADAS_LKA", 0, values)
+
+    return _apply_checksum(packer, "ADAS_LKA", CANBUS.cam, "ADAS_LKA_Checksum", values)
+
+
+def create_idb_control(packer, frame, drive_off_request, bus=0):
+    """
+    Create ADAS_IDB message (0x131) used for drive-off requests.
+    """
+    values = {
+        "ADAS_IDB_Checksum": 0,
+        "ADAS_IDB_Alive": frame % 15,
+        "SECCAN_ADAS_IDB": 0,
+        "ADAS_ACC_IDB_DriveOff": drive_off_request,
+    }
+    return _apply_checksum(packer, "ADAS_IDB", bus, "ADAS_IDB_Checksum", values)
+
+
+def create_mfs_control_button(packer, frame, cruise_on_off=1, up_control=1, bus=0):
+    """
+    Create MFS_Control_Button message on the Info CAN.
+    """
+    values = {
+        "CHSKM_MFS_Control_Button": 0,
+        "ALV_MFS_Control_Button": frame % 15,
+        "MFS_CruiseOn_Off": cruise_on_off,
+        "MFS_UpControl": up_control,
+    }
+    return _apply_checksum(
+        packer,
+        "MFS_Control_Button",
+        bus,
+        "CHSKM_MFS_Control_Button",
+        values,
+    )
+
+
+def create_adas_bcm_status(packer, frame, adas_status=1, headlight_request=0,
+                           indicator_request=0, foldmirror_request=0, seccan_val=1, bus=0):
+    """
+    Create ADAS_BCM_Status (0x20F) on the body CAN.
+    """
+    values = {
+        "ADAS_BCM_Status": adas_status,
+        "ADAS_BCM_HeadlightReq": headlight_request,
+        "ADAS_BCM_IndicatorlightReq": indicator_request,
+        "ADAS_BCM_FoldMirrorReq": foldmirror_request,
+        "SECCAN_ADAS_BCM_Sts": seccan_val,
+    }
+    return packer.make_can_msg("ADAS_BCM_Status", bus, values)
+
+
+def create_bcm_central_lock(packer, frame, stat_cdl_led=0, door_unlock_fl=0, atws=0,
+                            door_lock_fl=0, central_lock_sw_sts=0, bus=0):
+    """
+    Create BCM_STAT_CENTRAL_LOCK message with checksum.
+    """
+    values = {
+        "CHKSM_BCM_CENTRAL_LOCK": 0,
+        "ALV_BCM_CENTRAL_LOCK": frame % 15,
+        "STAT_CDL_LED": stat_cdl_led,
+        "STAT_DoorUnlockFL": door_unlock_fl,
+        "STAT_ATWS": atws,
+        "STAT_DoorLockFL": door_lock_fl,
+        "BCM_CentralLockSwSts": central_lock_sw_sts,
+    }
+    return _apply_checksum(
+        packer,
+        "BCM_STAT_CENTRAL_LOCK",
+        bus,
+        "CHKSM_BCM_CENTRAL_LOCK",
+        values,
+    )
+
+
+def create_doorfl_lock_command(packer, counter=0, bus=0):
+    """
+    Create DoorFLCommand message (no checksum).
+    """
+    values = {
+        "NDoorFLVehicleLocked": 1,
+        "NDoorFLVehicleMoving": 1,
+        "NDoorFLOpenInvRequested": 0,
+        "NDoorFLOpenRequested": 1,
+        "NDoorFLChildLocked": 0,
+        "NDoorFLVehicleCrash": 0,
+        "NDoorFLCommandCounter": counter,
+        "NDoorFLCloseInvRequested": 0,
+        "NDoorFLCloseRequested": 1,
+    }
+    return packer.make_can_msg("DoorFLCommand", bus, values)
 

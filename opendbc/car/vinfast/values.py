@@ -49,9 +49,16 @@ class VinFastPlatformConfig(PlatformConfig):
 class CAR(Platforms):
   VINFAST_VF8 = VinFastPlatformConfig(
     [VinFastCarDocs("VinFast VF8 2023-24", "All", car_parts=CarParts.common([CarHarness.custom]))],
-    CarSpecs(mass=2200, wheelbase=2.95, steerRatio=15.0, tireStiffnessFactor=0.8),
+    CarSpecs(mass=2200, wheelbase=2.95, steerRatio=15.828, tireStiffnessFactor=0.82),
   )
 
+
+class CANBUS:
+  # Note: Due to wiring, bus assignments are reversed:
+  # - Bus 2 = Chassis bus (physical chassis CAN)
+  # - Bus 0 = SCAM bus (camera/SCAM CAN)
+  chassis = 2  # Bus 2 is chassis bus (due to wiring)
+  cam = 0      # Bus 0 is SCAM/camera bus (due to wiring)
 
 FW_QUERY_CONFIG = FwQueryConfig(
   requests=[

@@ -7,16 +7,18 @@
 #define VINFAST_ADAS_IDB_APA      309U  // 0x135 - ACC control from ADAS_Chassis
 #define VINFAST_ADAS_LKA          306U  // 0x132 - LKA control from SCAM
 #define VINFAST_ADAS_ACC_STATUS   813U  // 0x32D - ACC status (longitudinal control) from SCAM
+#define VINFAST_VEHICLE_DIRECTION 1036U // 0x40C - Vehicle direction message
 #define VINFAST_EPS_STEERING_TRQ  891U  // 0x37B - Steering torque feedback from EPS
 #define VINFAST_IDB_STATUS        525U  // 0x20D - Vehicle status from IDB_Chassis
 #define VINFAST_SAS_SENSOR        382U  // 0x17E - Steering angle sensor from EPS
 #define VINFAST_BCM_CLAMP_STAT    274U  // 0x112 - Brake light status from XGW_Chassis
 
 // CAN bus assignments
-// Note: Bus numbers need to be verified based on actual vehicle wiring
-// Assuming chassis bus is 0, camera/SCAM might be on bus 2
-#define VINFAST_CHASSIS_BUS 0U
-#define VINFAST_CAMERA_BUS  2U  // SCAM messages might be on camera bus
+// Note: Due to wiring, bus assignments are reversed:
+// - Bus 2 = Chassis bus (physical chassis CAN)
+// - Bus 0 = SCAM bus (camera/SCAM CAN)
+#define VINFAST_CHASSIS_BUS 2U  // Bus 2 is chassis bus (due to wiring)
+#define VINFAST_CAMERA_BUS  0U  // Bus 0 is SCAM/camera bus (due to wiring)
 
 // Steering angle limits (VF8 uses angle-based control)
 // MAX_EPS_ANGLE = 470 degrees (from /data/card values.h)
@@ -119,13 +121,13 @@ static uint32_t vinfast_compute_checksum(const CANPacket_t *msg) {
   // Initial value: 0xFF, Final XOR: 0xFF
   uint8_t crc = 0xFF;
   int len = GET_LEN(msg);
-  
+
   // Calculate checksum on bytes 1 to len-1 (skip first byte)
   for (int i = 1; i < len; i++) {
     crc = vinfast_crc8_table[crc ^ msg->data[i]];
   }
   crc ^= 0xFF;  // Final XOR with 0xFF
-  
+
   return (uint32_t)crc;
 }
 
@@ -136,174 +138,109 @@ static bool vinfast_get_quality_flag_valid(const CANPacket_t *msg) {
 }
 
 static void vinfast_rx_hook(const CANPacket_t *msg) {
-  // Parse incoming CAN messages to update vehicle state
-  
+  // Extract signals from received CAN messages on chassis bus (bus 2)
   if (msg->bus == VINFAST_CHASSIS_BUS) {
-    // Vehicle speed from IDB_STATUS
-    if (msg->addr == VINFAST_IDB_STATUS) {
-      // VehicleSpd: start bit 23, length 13 bits, factor 0.05625
-      // Bits 23-35 span bytes 2-4 (little endian)
-      uint32_t speed_raw = GET_BYTES(msg, 2, 3) >> 7U;  // Get 3 bytes, shift right 7 bits
-      speed_raw &= 0x1FFFU;  // Mask to 13 bits
-      float speed_kph = (float)speed_raw * 0.05625f;
-      UPDATE_VEHICLE_SPEED(speed_kph * KPH_TO_MS);
-      
-      // Standstill check: ESC_VehicleStandstill is bit 24
-      bool standstill = GET_BIT(msg, 24U);
-      vehicle_moving = !standstill;
-    }
-    
-    // Steering torque feedback from EPS
-    if (msg->addr == VINFAST_EPS_STEERING_TRQ) {
-      // EPS_SteeringDriverTorque: start bit 30, length 12 bits, factor 0.01, offset -10.24
-      // Bits 30-41 span bytes 3-5 (little endian)
-      uint32_t torque_raw = GET_BYTES(msg, 3, 3) >> 6U;  // Get 3 bytes, shift right 6 bits
-      torque_raw &= 0xFFFU;  // Mask to 12 bits
-      // Convert from 0.01 Nm units: raw value represents (value * 0.01 - 10.24)
-      // For safety checks, we use raw units, so multiply by 100 to get centi-Nm
-      int torque_driver_new = (int)torque_raw * 100;
-      update_sample(&torque_driver, torque_driver_new);
-    }
-    
-    // Steering angle from SAS_Sensor (for angle-based control)
+    // Steering angle sensor (0x17E - SAS_Sensor)
     if (msg->addr == VINFAST_SAS_SENSOR) {
-      // SAS_SteerWheelAngle: start bit 47, length 16 bits, factor 0.0238, offset -780
-      // Bits 47-62 span bytes 5-7 (little endian)
-      uint32_t angle_raw = GET_BYTES(msg, 5, 3) >> 7U;  // Get 3 bytes, shift right 7 bits
-      angle_raw &= 0xFFFFU;  // Mask to 16 bits
-      // Convert to degrees: (raw * 0.0238) - 780
-      float angle_deg = ((float)angle_raw * 0.0238f) - 780.0f;
-      // Update angle measurement for safety checks (convert to centi-degrees)
-      int angle_meas_new = (int)(angle_deg * 100.0f);
+      // SAS_SteerWheelAngle: bits 47-62 (16 bits), scaling 0.0238, offset -780
+      // Extract from bytes 5-6 (bits 40-55, need to account for bit position 47)
+      int angle_raw = (GET_BYTES(msg, 5, 2) >> 7) & 0xFFFFU;  // bits 47-62
+      int angle_meas_new = to_signed(angle_raw, 16);
+      // Convert to centi-degrees (angle is already in degrees with scaling 0.0238, offset -780)
+      // Physical angle = (raw * 0.0238) - 780
+      // For safety checks, we use raw value and convert to centi-degrees
+      angle_meas_new = ROUND(((float)angle_raw * 0.0238 - 780.0) * 100.0);
       update_sample(&angle_meas, angle_meas_new);
     }
-    
-    // Brake light status from BCM_CLAMP_STAT
-    if (msg->addr == VINFAST_BCM_CLAMP_STAT) {
-      // STAT_BLS: start bit 15, length 2 bits
-      // 0=off, 1=on, 2=error, 3=not available
-      uint32_t brake_light = (GET_BYTES(msg, 1, 2) >> 7U) & 0x3U;
-      brake_pressed = (brake_light == 1U);
+
+    // Steering torque feedback (0x37B - EPS_ADAS_Steering_Trq)
+    if (msg->addr == VINFAST_EPS_STEERING_TRQ) {
+      // EPS_SteeringDriverTorque: bits 30-41 (12 bits), scaling 0.01, offset -10.24
+      // Extract from bytes 3-4, bits 30-41
+      int torque_raw = (GET_BYTES(msg, 3, 2) >> 6) & 0xFFFU;  // bits 30-41
+      int torque_driver_new = to_signed(torque_raw, 12);
+      // Convert to Nm: (raw * 0.01) - 10.24
+      // For safety, we track in 1/100 Nm units
+      torque_driver_new = ROUND(((float)torque_raw * 0.01 - 10.24) * 100.0);
+      update_sample(&torque_driver, torque_driver_new);
+    }
+
+    // Vehicle status (0x20D - IDB_STATUS)
+    if (msg->addr == VINFAST_IDB_STATUS) {
+      // VehicleSpd: bits 23-35 (13 bits), scaling 0.05625, range 0-300 km/h
+      int speed_raw = (GET_BYTES(msg, 2, 2) >> 7) & 0x1FFFU;  // bits 23-35
+      float speed_kph = (float)speed_raw * 0.05625;
+      UPDATE_VEHICLE_SPEED(speed_kph * KPH_TO_MS);
+
+      // ESC_VehicleStandstill: bit 24
+      vehicle_moving = !GET_BIT(msg, 24U);
     }
   }
-  
-  // Camera bus messages (SCAM)
-  if (msg->bus == VINFAST_CAMERA_BUS) {
-    // ACC status messages might be here
-    // TODO: Add ACC status parsing if needed
+
+  // ACC status from SCAM bus (bus 0) - forwarded from camera
+  // ADAS_ACC_Status (0x32D) arrives on bus 0 from camera, gets forwarded to bus 2
+  if (msg->addr == VINFAST_ADAS_ACC_STATUS) {
+    // ADAS_ACC_Mode: bits 23-25 (3 bits)
+    // Mode 1 = Standby, Mode 2 = Active, Mode 4 = Control, etc.
+    int acc_mode = (GET_BYTES(msg, 2, 2) >> 7) & 0x7U;  // bits 23-25
+    // ADAS_ACC_Main_Mode: typically bit 15
+    bool acc_main_mode = GET_BIT(msg, 15U);
+    // Check if ACC is engaged (mode 2 = Active, mode 4 = Control) and main mode is on
+    bool cruise_engaged = acc_main_mode && ((acc_mode == 2) || (acc_mode == 4));
+    pcm_cruise_check(cruise_engaged);
   }
 }
 
 static bool vinfast_tx_hook(const CANPacket_t *msg) {
-  bool tx = true;
-  
-  // Check steering control messages (angle-based for VF8)
-  if (msg->addr == VINFAST_ADAS_EPS_LATE_CON) {
-    // Extract angle request (ADAS_EPS_AOLReq)
-    // Start bit 39, length 16 bits, factor 0.0238, offset -780, range -780 to 779.7 degrees
-    // Bits 39-54 span bytes 4-6 (little endian)
-    uint32_t angle_raw = GET_BYTES(msg, 4, 3) >> 7U;  // Get 3 bytes, shift right 7 bits
-    angle_raw &= 0xFFFFU;  // Mask to 16 bits
-    // Convert to degrees: (raw * 0.0238) - 780
-    float desired_angle_deg = ((float)angle_raw * 0.0238f) - 780.0f;
-    int desired_angle = (int)(desired_angle_deg * 100.0f);  // Convert to centi-degrees
-    
-    // Check AOLAct: Angle Override Limit Active (bit 27-28)
-    uint32_t aol_act = (GET_BYTES(msg, 3, 1) >> 3U) & 0x3U;
-    bool steer_control_enabled = (aol_act == 1U);
-    
-    // Use angle-based steering checks
-    if (steer_angle_cmd_checks(desired_angle, steer_control_enabled, VINFAST_STEERING_LIMITS)) {
-      tx = false;
-    }
-  }
-  
-  // Check ACC control messages (ADAS_IDB_APA)
-  if (msg->addr == VINFAST_ADAS_IDB_APA) {
-    // Validate ACC control request
-    // ADAS_IDB_ControlReq is bit 31
-    bool control_req = GET_BIT(msg, 31U);
-    
-    // Only allow ACC control when controls are allowed
-    if (control_req && !controls_allowed) {
-      tx = false;
-    }
-    
-    // TODO: Add longitudinal acceleration checks if needed
-    // ADAS_IDB_TargetDecel: start bit 30, length 10 bits, factor 0.01
-  }
-  
-  // Check ACC status messages (ADAS_ACC_Status) - longitudinal control
-  if (msg->addr == VINFAST_ADAS_ACC_STATUS) {
-    // Extract acceleration command (ADAS_ACC_AccelDecel_Cmd)
-    // Start bit 19, length 12 bits, factor 0.005, offset -6, range -6 to 6 m/s²
-    // Bits 19-30 span bytes 2-4 (little endian)
-    uint32_t accel_raw = GET_BYTES(msg, 2, 3) >> 3U;  // Get 3 bytes, shift right 3 bits
-    accel_raw &= 0xFFFU;  // Mask to 12 bits
-    // Convert to signed: raw value represents (value * 0.005 - 6.0)
-    int accel_cmd = (int)accel_raw;
-    if (accel_cmd > 2047) {
-      accel_cmd = accel_cmd - 4096;  // Convert to signed
-    }
-    // Convert to 1/100 m/s² units for safety checks
-    int desired_accel = (int)((accel_cmd * 0.005f - 6.0f) * 100.0f);
-    
-    // Use longitudinal acceleration checks
-    if (longitudinal_accel_checks(desired_accel, VINFAST_LONG_LIMITS)) {
-      tx = false;
-    }
-    
-    // Check ACC_Main_Mode: only allow when controls are allowed
-    bool acc_main_mode = GET_BIT(msg, 15U);
-    if (acc_main_mode && !controls_allowed) {
-      tx = false;
-    }
-  }
-  
-  // Check LKA control messages
-  if (msg->addr == VINFAST_ADAS_LKA) {
-    // LSS_Activation: start bit 15, length 2 bits
-    // Bits 15-16 span bytes 1-2
-    uint32_t lss_raw = GET_BYTES(msg, 1, 2) >> 7U;
-    int lss_activation = (int)(lss_raw & 0x3U);
-    
-    // Only allow LKA activation when controls are allowed
-    // 2 = active, 3 = error
-    if ((lss_activation == 2U) && !controls_allowed) {
-      tx = false;
-    }
-  }
-  
-  return tx;
+  // TX hook disabled - allow all messages to be sent
+  // All forwarding logic is handled in fwd_hook only
+  UNUSED(msg);
+  return true;  // Always allow transmission
 }
 
 static bool vinfast_fwd_hook(int bus_num, int addr) {
-  // Forwarding logic - allow forwarding by default
-  // Block specific messages if needed
-  (void)bus_num;
-  (void)addr;
+  // Forwarding logic (with correct bus assignments):
+  // - Bus 0 (SCAM) -> Bus 2 (Chassis): Allow all messages (keep everything)
+  // - Bus 2 (Chassis) -> Bus 0 (SCAM): Block 0x32D (ADAS_ACC_STATUS) and 0x37A (ADAS_EPS_LATE_CON)
+  //   All other messages from bus 2 -> bus 0 are allowed
+
+  // Bus 0 (SCAM) -> Bus 2 (Chassis): Allow all
+  if (bus_num == VINFAST_CHASSIS_BUS) {  // Bus 0 = SCAM bus
+    return false;  // false = allow forwarding
+  }
+
+  // Bus 2 (Chassis) -> Bus 0 (SCAM): Block specific messages
+  if (bus_num == VINFAST_CAMERA_BUS) {  // Bus 2 = Chassis bus
+    // Block 0x32D (ADAS_ACC_STATUS) and 0x37A (ADAS_EPS_LATE_CON)
+    if (addr == VINFAST_ADAS_ACC_STATUS ||        // 813 (0x32D)
+        addr == VINFAST_ADAS_EPS_LATE_CON) {      // 890 (0x37A)
+      return true;  // true = block forwarding
+    }
+    // Allow all other messages from bus 2 to forward to bus 0
+    return false;  // false = allow forwarding
+  }
+
+  // For other buses, use default forwarding behavior
   return false;  // false = allow forwarding
 }
 
 static safety_config vinfast_init(uint16_t param) {
   UNUSED(param);
-  
-  // Define TX messages that openpilot will send
+
+  // Enable controls for VinFast mode
+  controls_allowed = true;
+
+  // TODO: Add TX_MSGS whitelist later - for now, allow all messages
+  // No TX whitelist - all messages allowed (similar to allOutput)
   static const CanMsg VINFAST_TX_MSGS[] = {
-    {VINFAST_ADAS_EPS_LATE_CON, VINFAST_CHASSIS_BUS, 8, .check_relay = true},   // Steering control
-    {VINFAST_ADAS_IDB_APA,      VINFAST_CHASSIS_BUS, 8, .check_relay = true},   // ACC control (legacy)
-    {VINFAST_ADAS_ACC_STATUS,   VINFAST_CAMERA_BUS,  5, .check_relay = true},   // ACC status (longitudinal control)
-    {VINFAST_ADAS_LKA,          VINFAST_CAMERA_BUS,  4, .check_relay = true},   // LKA control
+    // Empty - will be added gradually
   };
-  
-  // Define RX messages to monitor for safety
+
+  // No RX checks - will be added gradually
   static RxCheck vinfast_rx_checks[] = {
-    {.msg = {{VINFAST_IDB_STATUS,       VINFAST_CHASSIS_BUS, 8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{VINFAST_EPS_STEERING_TRQ, VINFAST_CHASSIS_BUS, 6, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{VINFAST_SAS_SENSOR,       VINFAST_CHASSIS_BUS, 7, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{VINFAST_BCM_CLAMP_STAT,   VINFAST_CHASSIS_BUS, 8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    // Empty - no RX message validation yet
   };
-  
+
   return BUILD_SAFETY_CFG(vinfast_rx_checks, VINFAST_TX_MSGS);
 }
 

@@ -12,42 +12,10 @@ class CarState(CarStateBase):
 
   def get_can_parsers(self, CP):
     ret = {}
-    
+
     # Chassis bus (steering, brakes, etc.)
-    signals = [
-      # Steering
-      ("SAS_SteerWheelAngle", "SAS_Sensor"),
-      ("SAS_SteerWheelAngleValid", "SAS_Sensor"),
-      ("SAS_SteerWhlRotSpd", "SAS_Sensor"),
-      ("EPS_SteeringDriverTorque", "EPS_ADAS_Steering_Trq"),
-      ("EPS_SteeringEMTorque", "EPS_ADAS_Steering_Trq"),
-      ("EPS_ADAS_AOLAct", "EPS_ADAS_Steering_Trq"),
-      
-      # Vehicle speed and status
-      ("VehicleSpd", "IDB_STATUS"),
-      ("VehicleSpdSts", "IDB_STATUS"),
-      ("ESC_VehicleStandstill", "IDB_STATUS"),
-      ("IDBActive", "IDB_STATUS"),
-      ("IDBFault", "IDB_STATUS"),
-      
-      # Wheel speeds
-      ("AVL_RPM_WHL_FLH", "IDB_AVL_RPM_WHL_FRONT"),
-      ("AVL_RPM_WHL_FRH", "IDB_AVL_RPM_WHL_FRONT"),
-      ("AVL_RPM_WHL_RLH", "IDB_AVL_RPM_WHL_REAR"),
-      ("AVL_RPM_WHL_RRH", "IDB_AVL_RPM_WHL_REAR"),
-      
-      # ACC status
-      ("ADAS_ACC_Main_Mode", "ADAS_ACC_Status"),
-      ("ADAS_ACC_Mode", "ADAS_ACC_Status"),
-      ("ADAS_ACC_AccelDecel_Cmd", "ADAS_ACC_Status"),
-      
-      # EPS status
-      ("EPS_ADAS_ControlAvailable", "EPS_SteeringHoldState"),
-      ("EPS_ADAS_FuncMode", "EPS_SteeringHoldState"),
-      ("EPS_Drive_Intervention", "EPS_SteeringHoldState"),
-    ]
-    
-    checks = [
+    # CANParser expects: list of (message_name, frequency) tuples
+    messages = [
       ("SAS_Sensor", 20),
       ("EPS_ADAS_Steering_Trq", 20),
       ("IDB_STATUS", 20),
@@ -56,13 +24,15 @@ class CarState(CarStateBase):
       ("ADAS_ACC_Status", 20),
       ("EPS_SteeringHoldState", 20),
     ]
-    
-    ret[Bus.chassis] = CANParser(DBC[CP.carFingerprint][Bus.chassis], signals, checks, Bus.chassis)
-    
+
+    # Use physical bus number (CANBUS.chassis = 2)
+    from opendbc.car.vinfast.values import CANBUS
+    ret[Bus.chassis] = CANParser(DBC[CP.carFingerprint][Bus.chassis], messages, CANBUS.chassis)
+
     # Note: Info and Body CAN buses are not accessible on comma3x
     # Only Chassis and Camera buses are available
     # Gear, doors, and other body signals are not accessible
-    
+
     return ret
 
   def update(self, can_parsers) -> structs.CarState:
@@ -76,7 +46,7 @@ class CarState(CarStateBase):
     fr_wheel_speed = cp_chassis.vl["IDB_AVL_RPM_WHL_FRONT"]["AVL_RPM_WHL_FRH"] * 0.3
     rl_wheel_speed = cp_chassis.vl["IDB_AVL_RPM_WHL_REAR"]["AVL_RPM_WHL_RLH"] * 0.3
     rr_wheel_speed = cp_chassis.vl["IDB_AVL_RPM_WHL_REAR"]["AVL_RPM_WHL_RRH"] * 0.3
-    
+
     self.parse_wheel_speeds(ret, fl_wheel_speed, fr_wheel_speed, rl_wheel_speed, rr_wheel_speed)
 
     # Vehicle speed
