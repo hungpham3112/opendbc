@@ -16,13 +16,13 @@ class CarState(CarStateBase):
     # Chassis bus (steering, brakes, etc.)
     # CANParser expects: list of (message_name, frequency) tuples
     messages = [
-      ("SAS_Sensor", 20),
-      ("EPS_ADAS_Steering_Trq", 20),
-      ("IDB_STATUS", 20),
-      ("IDB_AVL_RPM_WHL_FRONT", 20),
-      ("IDB_AVL_RPM_WHL_REAR", 20),
-      ("ADAS_ACC_Status", 20),
-      ("EPS_SteeringHoldState", 20),
+      ("SAS_Sensor", 50),
+      ("EPS_ADAS_Steering_Trq", 50),
+      ("IDB_STATUS", 50),
+      ("IDB_AVL_RPM_WHL_FRONT", 50),
+      ("IDB_AVL_RPM_WHL_REAR", 50),
+      ("ADAS_ACC_Status", 50),
+      ("EPS_SteeringHoldState", 50),
     ]
 
     # Use physical bus number (CANBUS.chassis = 2)
